@@ -115,7 +115,7 @@ class TechManager : IsPartOfGameInfoSerialization {
         if (techCost < 0) 
             // no futher manipulation is to be done to the tech cost
             // (-0.8).asInt() gives 0 therefore should always just return -1 instead
-            return -1;
+            return Int.MAX_VALUE;
         
         if (civInfo.isHuman())
             techCost *= civInfo.getDifficulty().researchCostModifier
@@ -269,11 +269,6 @@ class TechManager : IsPartOfGameInfoSerialization {
         val techCost = costOfTech(currentTechnology)
         if (techsInProgress[currentTechnology]!! < techCost)
             return
-        
-        // For unresearchable tech. Placeholders for end of research tree, 
-        // to avoid high recursion depth and stackover when having high science e.g. 1B   
-        if (techCost == -1) 
-            return 
         
         // We finished it!
         // http://www.civclub.net/bbs/forum.php?mod=viewthread&tid=123976
