@@ -113,8 +113,7 @@ class TechManager : IsPartOfGameInfoSerialization {
         var techCost = getRuleset().technologies[techName]!!.cost.toFloat()
         
         if (techCost < 0) 
-            // no futher manipulation is to be done to the tech cost
-            // (-0.8).asInt() gives 0 therefore should always just return -1 instead
+            // Use negative vals in JSON to signify as Inf
             return Int.MAX_VALUE;
         
         if (civInfo.isHuman())
@@ -228,7 +227,13 @@ class TechManager : IsPartOfGameInfoSerialization {
         // http://www.civclub.net/bbs/forum.php?mod=viewthread&tid=123976
         // Apparently yes, we care about the absolute tech cost, not the actual calculated-for-this-player tech cost,
         //  so don't change to costOfTech()
-        return min(overflowScience, max(civInfo.stats.statsForNextTurn.science.toInt() * 5,
+        
+        // for sufficiently high science (achieved through cheat mods) it will cause an integer overflow.
+        val maxStatsFor5Turns = 
+            if (Integer.MAX_VALUE / 5 > civInfo.stats.statsForNextTurn.science)  
+            civInfo.stats.statsForNextTurn.science.toInt() * 5 
+            else Integer.MAX_VALUE
+        return min(overflowScience, max(maxStatsFor5Turns,
                 getRuleset().technologies[currentTechnologyName()]!!.cost))
     }
 
@@ -262,6 +267,61 @@ class TechManager : IsPartOfGameInfoSerialization {
 
         addScience(finalScienceToAdd)
     }
+    
+    tailrec fun recursiveTechResearch(scienceGet: Int) {
+        val currentTechnology = currentTechnologyName() ?: return
+        techsInProgress[currentTechnology] = researchOfTech(currentTechnology) + scienceGet
+        val techCost = costOfTech(currentTechnology)
+        if (techsInProgress[currentTechnology]!! < techCost)
+            return
+
+        // We finished it!
+        // http://www.civclub.net/bbs/forum.php?mod=viewthread&tid=123976
+        val extraScienceLeftOver = techsInProgress[currentTechnology]!! - techCost
+        val a = limitOverflowScience(extraScienceLeftOver)
+        overflowScience += limitOverflowScience(extraScienceLeftOver)
+
+        val isNewTech = techsResearched.add(currentTechnology)
+
+        // this is to avoid concurrent modification problems
+        val newTech = getRuleset().technologies[currentTechnology]!!
+        if (!newTech.isContinuallyResearchable())
+            techsToResearch.remove(currentTechnology)
+        else
+            repeatingTechsResearched++
+        techsInProgress.remove(currentTechnology)
+        researchedTechnologies = researchedTechnologies.withItem(newTech)
+        addTechToTransients(newTech)
+
+        moveToNewEra(true)
+
+        notifyTechAddition(currentTechnology, newTech, isNewTech, true)
+
+        updateTransientBooleans()
+
+        // In the case of a player hurrying research, this civ's resource availability may now be out of date
+        // - e.g. when an owned tile by luck already has an appropriate improvement or when a tech provides a resource.
+        // That can be seen on WorldScreenTopBar, so better update.
+        civInfo.cache.updateCivResources()
+
+        for (city in civInfo.cities) {
+            city.reassignPopulationDeferred()
+        }
+
+        obsoleteOldUnits(currentTechnology)
+
+        val currentTech = currentTechnologyName() ?: return
+        val realOverflow = getOverflowScience()
+        val scienceSpent = researchOfTech(currentTech) + realOverflow
+        if (scienceSpent < costOfTech(currentTech)) {
+            return
+        }
+        overflowScience = 0
+        if (realOverflow == 0) {
+            return
+        }
+        return recursiveTechResearch(realOverflow)
+    }
 
     fun addScience(scienceGet: Int) {
         val currentTechnology = currentTechnologyName() ?: return
@@ -272,7 +332,8 @@ class TechManager : IsPartOfGameInfoSerialization {
         
         // We finished it!
         // http://www.civclub.net/bbs/forum.php?mod=viewthread&tid=123976
-        val extraScienceLeftOver = techsInProgress[currentTechnology]!! - costOfTech(currentTechnology)
+        val extraScienceLeftOver = techsInProgress[currentTechnology]!! - techCost
+        val a = limitOverflowScience(extraScienceLeftOver)
         overflowScience += limitOverflowScience(extraScienceLeftOver)
         addTechnology(currentTechnology)
     }
@@ -288,7 +349,7 @@ class TechManager : IsPartOfGameInfoSerialization {
         if (scienceSpent >= costOfTech(currentTechnology)) {
             overflowScience = 0
             if (realOverflow != 0)
-                addScience(realOverflow)
+                recursiveTechResearch(realOverflow)
         }
     }
 
@@ -311,7 +372,26 @@ class TechManager : IsPartOfGameInfoSerialization {
         addTechToTransients(newTech)
 
         moveToNewEra(showNotification)
+        
+        notifyTechAddition(techName, newTech, isNewTech, showNotification)
 
+        updateTransientBooleans()
+
+        // In the case of a player hurrying research, this civ's resource availability may now be out of date
+        // - e.g. when an owned tile by luck already has an appropriate improvement or when a tech provides a resource.
+        // That can be seen on WorldScreenTopBar, so better update.
+        civInfo.cache.updateCivResources()
+
+        for (city in civInfo.cities) {
+            city.reassignPopulationDeferred()
+        }
+
+        obsoleteOldUnits(techName)
+        
+        updateResearchProgress()
+    }
+    
+    private fun notifyTechAddition(techName: String, newTech: Technology, isNewTech: Boolean, showNotification: Boolean = true) {
         if (!civInfo.isSpectator() && showNotification)
             civInfo.addNotification("Research of [$techName] has completed!", TechAction(techName),
                 NotificationCategory.General,
@@ -335,26 +415,12 @@ class TechManager : IsPartOfGameInfoSerialization {
             }
         }
 
-        updateTransientBooleans()
-
-        // In the case of a player hurrying research, this civ's resource availability may now be out of date
-        // - e.g. when an owned tile by luck already has an appropriate improvement or when a tech provides a resource.
-        // That can be seen on WorldScreenTopBar, so better update.
-        civInfo.cache.updateCivResources()
-
-        for (city in civInfo.cities) {
-            city.reassignPopulationDeferred()
-        }
-
-        obsoleteOldUnits(techName)
-
         for (unique in civInfo.getMatchingUniques(UniqueType.MayanGainGreatPerson)) {
             if (unique.params[1] != techName) continue
             civInfo.addNotification("You have unlocked [The Long Count]!",
                 MayaLongCountAction(), NotificationCategory.General, MayaCalendar.notificationIcon)
         }
 
-        updateResearchProgress()
     }
 
     /** A variant of kotlin's [associateBy] that omits null values */
